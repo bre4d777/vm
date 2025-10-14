@@ -48,7 +48,18 @@ divider() {
 }
 
 check_nix_env() {
-    local nix_file=".idx/dev.nix"
+    # Navigate to root and clean up
+    cd ~ || exit 1
+    
+    msg info "Cleaning up workspace..."
+    [ -d "flutter" ] && rm -rf flutter
+    [ -d "myapp" ] && rm -rf myapp
+    
+    # Create and navigate to VM directory
+    mkdir -p vm
+    cd vm || exit 1
+    
+    local nix_file="../.idx/dev.nix"
     
     if [ ! -f "$nix_file" ]; then
         header
@@ -56,7 +67,7 @@ check_nix_env() {
         msg error "Nix environment not detected!"
         echo
         msg info "Creating configuration..."
-        mkdir -p .idx
+        mkdir -p ../.idx
         
         cat > "$nix_file" <<'EOF'
 { pkgs, ... }: {
@@ -144,6 +155,8 @@ EOF
         msg warn "Rebuild your Nix environment and run again"
         exit 1
     fi
+    
+    msg ok "Workspace cleaned and ready"
 }
 
 check_deps() {
