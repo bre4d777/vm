@@ -55,8 +55,7 @@ check_nix_env() {
     [ -d "flutter" ] && rm -rf flutter
     [ -d "myapp" ] && rm -rf myapp
     
-    # Create and navigate to VM directory
-    mkdir -p vm
+    #  navigate to VM directory
     cd vm || exit 1
     
     local nix_file="../.idx/dev.nix"
