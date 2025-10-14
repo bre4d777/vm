@@ -1,0 +1,444 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly C_RESET='\033[0m'
+readonly C_BOLD='\033[1m'
+readonly C_DIM='\033[2m'
+readonly C_RED='\033[0;31m'
+readonly C_GREEN='\033[0;32m'
+readonly C_YELLOW='\033[0;33m'
+readonly C_BLUE='\033[0;34m'
+readonly C_CYAN='\033[0;36m'
+readonly C_MAGENTA='\033[0;35m'
+readonly C_BRED='\033[1;31m'
+readonly C_BGREEN='\033[1;32m'
+readonly C_BYELLOW='\033[1;33m'
+readonly C_BBLUE='\033[1;34m'
+readonly C_BCYAN='\033[1;36m'
+readonly C_BMAGENTA='\033[1;35m'
+
+VM_DIR="${HOME}/bread-vm"
+VM_DISK_SIZE="9G"
+VM_MEMORY="25600"
+VM_CPUS="7"
+VM_SSH_PORT="2222"
+
+OS_TYPE="Debian 11"
+IMG_URL="https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
+USERNAME="root"
+
+header() {
+    clear
+    echo -e "${C_BMAGENTA}${C_BOLD}BREAD-VM MANAGER${C_RESET}"
+    divider
+}
+
+msg() {
+    case $1 in
+        info) echo -e "${C_BBLUE}▸${C_RESET} $2" ;;
+        warn) echo -e "${C_BYELLOW}⚠${C_RESET} $2" ;;
+        error) echo -e "${C_BRED}✗${C_RESET} $2" ;;
+        ok) echo -e "${C_BGREEN}✓${C_RESET} $2" ;;
+        input) echo -en "${C_BCYAN}→${C_RESET} $2" ;;
+    esac
+}
+
+divider() {
+    echo -e "${C_DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+}
+
+check_nix_env() {
+    local nix_file=".idx/dev.nix"
+    
+    if [ ! -f "$nix_file" ]; then
+        header
+        echo
+        msg error "Nix environment not detected!"
+        echo
+        msg info "Creating configuration..."
+        mkdir -p .idx
+        
+        cat > "$nix_file" <<'EOF'
+{ pkgs, ... }: {
+  channel = "stable-24.05";
+
+  packages = with pkgs; [
+    unzip
+    openssh
+    openssl
+    git
+    qemu_kvm
+    sudo
+    cdrkit
+    cloud-utils
+    qemu
+  ];
+
+  env = {
+    EDITOR = "nano";
+  };
+
+  idx = {
+    workspace = {
+      onCreate = { };
+      onStart = { };
+    };
+
+    previews = {
+      enable = false;
+    };
+  };
+}
+EOF
+        
+        msg ok "Configuration created"
+        echo
+        msg warn "Rebuild your Nix environment and run again"
+        exit 1
+    fi
+    
+    local has_qemu=$(grep -q "qemu" "$nix_file" && echo "yes" || echo "no")
+    
+    if [ "$has_qemu" = "no" ]; then
+        header
+        echo
+        msg error "Missing QEMU in configuration"
+        echo
+        msg info "Updating configuration..."
+        
+        cat > "$nix_file" <<'EOF'
+{ pkgs, ... }: {
+  channel = "stable-24.05";
+
+  packages = with pkgs; [
+    unzip
+    openssh
+    openssl
+    git
+    qemu_kvm
+    sudo
+    cdrkit
+    cloud-utils
+    qemu
+  ];
+
+  env = {
+    EDITOR = "nano";
+  };
+
+  idx = {
+    workspace = {
+      onCreate = { };
+      onStart = { };
+    };
+
+    previews = {
+      enable = false;
+    };
+  };
+}
+EOF
+        
+        msg ok "Configuration updated"
+        echo
+        msg warn "Rebuild your Nix environment and run again"
+        exit 1
+    fi
+}
+
+check_deps() {
+    local missing=()
+    for cmd in qemu-system-x86_64 wget cloud-localds qemu-img; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    
+    if [ ${#missing[@]} -ne 0 ]; then
+        msg error "Missing: ${missing[*]}"
+        msg info "Rebuild your Nix environment"
+        exit 1
+    fi
+}
+
+cleanup() {
+    rm -f user-data meta-data
+}
+
+vm_exists() {
+    [ -f "$VM_DIR/vm.conf" ]
+}
+
+load_vm() {
+    if [ -f "$VM_DIR/vm.conf" ]; then
+        source "$VM_DIR/vm.conf"
+        return 0
+    fi
+    return 1
+}
+
+save_vm() {
+    cat > "$VM_DIR/vm.conf" <<EOF
+OS_TYPE="$OS_TYPE"
+IMG_URL="$IMG_URL"
+HOSTNAME="$HOSTNAME"
+USERNAME="$USERNAME"
+PASSWORD="$PASSWORD"
+IMG_FILE="$IMG_FILE"
+SEED_FILE="$SEED_FILE"
+CREATED="$CREATED"
+EOF
+}
+
+create_vm() {
+    header
+    echo
+    divider
+    echo -e "${C_BGREEN}  Creating New VM${C_RESET}"
+    divider
+    echo
+    
+    read -p "$(msg input "Hostname: ")" HOSTNAME
+    while [ -z "$HOSTNAME" ]; do
+        msg error "Hostname required"
+        read -p "$(msg input "Hostname: ")" HOSTNAME
+    done
+    
+    read -s -p "$(msg input "Root password [papa]: ")" input_pass
+    echo
+    PASSWORD="${input_pass:-papa}"
+    
+    IMG_FILE="$VM_DIR/disk.img"
+    SEED_FILE="$VM_DIR/seed.iso"
+    CREATED="$(date '+%Y-%m-%d %H:%M:%S')"
+    
+    echo
+    divider
+    setup_image
+    save_vm
+    
+    echo
+    msg ok "VM created successfully!"
+    sleep 2
+}
+
+setup_image() {
+    mkdir -p "$VM_DIR"
+    
+    if [ -f "$IMG_FILE" ]; then
+        msg info "Using existing disk image"
+    else
+        msg info "Downloading Debian 11 cloud image..."
+        wget -q --show-progress "$IMG_URL" -O "$IMG_FILE.tmp"
+        mv "$IMG_FILE.tmp" "$IMG_FILE"
+        msg ok "Download complete"
+    fi
+    
+    msg info "Configuring disk (${VM_DISK_SIZE})..."
+    qemu-img resize "$IMG_FILE" "$VM_DISK_SIZE" &>/dev/null
+    
+    msg info "Setting up cloud-init..."
+    
+    cat > user-data <<EOF
+#cloud-config
+hostname: $HOSTNAME
+fqdn: $HOSTNAME.local
+manage_etc_hosts: true
+ssh_pwauth: true
+disable_root: false
+users:
+  - name: root
+    lock_passwd: false
+    passwd: $(openssl passwd -6 "$PASSWORD")
+chpasswd:
+  list: |
+    root:$PASSWORD
+  expire: false
+runcmd:
+  - hostnamectl set-hostname $HOSTNAME
+  - sed -i 's/PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - systemctl restart sshd
+package_update: false
+package_upgrade: false
+EOF
+
+    cat > meta-data <<EOF
+instance-id: bread-vm-$(date +%s)
+local-hostname: $HOSTNAME
+EOF
+
+    cloud-localds "$SEED_FILE" user-data meta-data &>/dev/null
+    msg ok "Configuration complete"
+}
+
+is_running() {
+    pgrep -f "bread-vm-qemu" &>/dev/null
+}
+
+start_vm() {
+    if is_running; then
+        msg warn "VM already running"
+        sleep 2
+        return 0
+    fi
+    
+    header
+    echo
+    divider
+    echo -e "${C_BGREEN}  Starting VM: ${C_CYAN}$HOSTNAME${C_RESET}"
+    divider
+    echo
+    echo -e "${C_BOLD}Connection Info:${C_RESET}"
+    echo -e "  ${C_CYAN}SSH:${C_RESET} ssh -p $VM_SSH_PORT root@localhost"
+    echo -e "  ${C_CYAN}Password:${C_RESET} $PASSWORD"
+    echo -e "  ${C_DIM}Wait ~30 seconds for first boot${C_RESET}"
+    echo
+    divider
+    echo
+    
+    qemu-system-x86_64 \
+        -name "bread-vm-qemu" \
+        -machine type=pc-i440fx-8.2 \
+        -smbios "type=1,manufacturer=BREAD,product=bread-vps,version=1.0,serial=$(date +%s)" \
+        -enable-kvm \
+        -m "$VM_MEMORY" \
+        -smp "$VM_CPUS" \
+        -cpu host \
+        -drive "file=$IMG_FILE,format=qcow2,if=virtio" \
+        -drive "file=$SEED_FILE,format=raw,if=virtio,readonly=on" \
+        -boot c \
+        -netdev "user,id=net0,hostfwd=tcp::$VM_SSH_PORT-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        -nographic \
+        -serial mon:stdio \
+        -device virtio-balloon-pci \
+        -device virtio-rng-pci \
+        -rtc base=utc
+    
+    echo
+    msg info "VM stopped"
+    sleep 2
+}
+
+stop_vm() {
+    if is_running; then
+        msg info "Stopping VM..."
+        pkill -f "bread-vm-qemu"
+        sleep 2
+        if is_running; then
+            pkill -9 -f "bread-vm-qemu"
+        fi
+        msg ok "VM stopped"
+    else
+        msg info "VM not running"
+    fi
+    sleep 2
+}
+
+show_info() {
+    header
+    echo
+    divider
+    echo -e "${C_BGREEN}  VM Information${C_RESET}"
+    divider
+    echo
+    echo -e "${C_CYAN}OS:${C_RESET}       $OS_TYPE"
+    echo -e "${C_CYAN}Hostname:${C_RESET} $HOSTNAME"
+    echo -e "${C_CYAN}Username:${C_RESET} $USERNAME"
+    echo -e "${C_CYAN}Password:${C_RESET} $PASSWORD"
+    echo -e "${C_CYAN}SSH Port:${C_RESET} $VM_SSH_PORT"
+    echo -e "${C_CYAN}Created:${C_RESET}  $CREATED"
+    echo
+    divider
+    echo
+    read -p "$(msg input "Press Enter to continue...")"
+}
+
+delete_vm() {
+    header
+    echo
+    divider
+    msg warn "This will DELETE the VM and ALL data!"
+    divider
+    echo
+    read -p "$(msg input "Type 'yes' to confirm: ")" confirm
+    
+    if [ "$confirm" = "yes" ]; then
+        if is_running; then
+            stop_vm
+        fi
+        rm -rf "$VM_DIR"
+        msg ok "VM deleted"
+    else
+        msg info "Cancelled"
+    fi
+    sleep 2
+}
+
+main_menu() {
+    while true; do
+        header
+        echo
+        
+        if vm_exists && load_vm; then
+            local status="${C_RED}● Stopped${C_RESET}"
+            is_running && status="${C_GREEN}● Running${C_RESET}"
+            
+            divider
+            echo -e "  ${C_BOLD}VM:${C_RESET} ${C_CYAN}$HOSTNAME${C_RESET}  $status"
+            divider
+            echo
+            
+            if is_running; then
+                echo -e "  ${C_BRED}1${C_RESET} Stop VM"
+            else
+                echo -e "  ${C_BGREEN}1${C_RESET} Start VM"
+            fi
+            
+            echo -e "  ${C_BCYAN}2${C_RESET} VM Info"
+            echo -e "  ${C_BRED}3${C_RESET} Delete VM"
+            echo -e "  ${C_BBLUE}0${C_RESET} Exit"
+        else
+            divider
+            echo -e "  ${C_BYELLOW}No VM Found${C_RESET}"
+            divider
+            echo
+            echo -e "  ${C_BGREEN}Setting up new VM...${C_RESET}"
+            echo
+            sleep 1
+            create_vm
+            continue
+        fi
+        
+        echo
+        divider
+        echo
+        
+        read -p "$(msg input "Choice: ")" choice
+        
+        case $choice in
+            1)
+                if is_running; then
+                    stop_vm
+                else
+                    start_vm
+                fi
+                ;;
+            2) show_info ;;
+            3) delete_vm ;;
+            0)
+                clear
+                echo
+                msg ok "Goodbye!"
+                echo
+                exit 0
+                ;;
+            *) msg error "Invalid option" ; sleep 1 ;;
+        esac
+    done
+}
+
+trap cleanup EXIT
+
+check_nix_env
+check_deps
+
+main_menu
