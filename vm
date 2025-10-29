@@ -259,7 +259,7 @@ disable_root: false
 users:
   - name: root
     lock_passwd: false
-    passwd: $(openssl passwd -6 "$PASSWORD")
+    passwd: $PASSWORD
 chpasswd:
   list: |
     root:$PASSWORD
